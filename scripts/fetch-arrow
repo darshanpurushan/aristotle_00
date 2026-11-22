@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+destination=${1:?Usage: fetch-arrow DESTINATION}
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+
+# The wheel distributes the native Arrow headers and shared libraries together.
+# Only those native files are extracted. The pipeline requires no interpreter.
+url=https://files.pythonhosted.org/packages/13/95/aec81f781c75cd10554dc17a25849c720d54feafb6f7847690478dcf5ef8/pyarrow-22.0.0-cp312-cp312-manylinux_2_28_x86_64.whl
+sha=c6c791b09c57ed76a18b03f2631753a4960eefbbca80f846da8baefc6491fcfe
+curl --fail --silent --show-error --location --retry 3 "$url" -o "$temporary/arrow.zip"
+printf '%s  %s\n' "$sha" "$temporary/arrow.zip" | sha256sum -c -
+unzip -q "$temporary/arrow.zip" 'pyarrow/include/*' \
+    'pyarrow/libarrow.so.2200' 'pyarrow/libparquet.so.2200' \
+    'pyarrow-22.0.0.dist-info/licenses/*' -d "$temporary/unpacked"
+mkdir -p "$destination"
+cp -R "$temporary/unpacked/pyarrow/." "$destination/"
+cp -R "$temporary/unpacked/pyarrow-22.0.0.dist-info/licenses" "$destination/"

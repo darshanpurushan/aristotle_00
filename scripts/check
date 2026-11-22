@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# != 2 ]]; then
+    echo "Usage: $0 OUTPUT_DIR EXPECTED_CSV_DIR" >&2
+    exit 2
+fi
+
+sql_string() {
+    local value=${1//\'/\'\'}
+    printf "'%s'" "$value"
+}
+
+compare() {
+    local table=$1 columns=$2
+    local parquet_path csv_path
+    parquet_path=$(sql_string "$output/$table/*.parquet")
+    csv_path=$(sql_string "$expected_folder/$table.csv")
+    "${DUCKDB:-duckdb}" -bail -list -noheader -c "
+        CREATE VIEW actual AS SELECT * FROM read_parquet($parquet_path);
+        CREATE VIEW expected AS SELECT * FROM read_csv($csv_path,
+            header=true, delim=',', columns={$columns}, allow_quoted_nulls=false);
+        SELECT '$table' || ': expected=' || (SELECT count(*) FROM expected)
+          || ', actual=' || (SELECT count(*) FROM actual)
+          || ', missing=' || (SELECT count(*) FROM (FROM expected EXCEPT ALL FROM actual))
+          || ', extra=' || (SELECT count(*) FROM (FROM actual EXCEPT ALL FROM expected));
+        SELECT CASE WHEN count(*) > 0 THEN error('Rows differ: $table') ELSE 'OK' END
+          FROM ((FROM expected EXCEPT ALL FROM actual)
+             UNION ALL (FROM actual EXCEPT ALL FROM expected));
+    "
+}
+
+output=$(realpath "$1")
+expected_folder=$(realpath "$2")
+compare user_daily "'user_id':'VARCHAR','day':'DATE','sessions':'BIGINT','events':'BIGINT','revenue_cents':'BIGINT','top_category':'VARCHAR'"
+compare campaign_daily "'campaign_id':'VARCHAR','channel':'VARCHAR','day':'DATE','sessions':'BIGINT','purchasing_sessions':'BIGINT','revenue_cents':'BIGINT','assisted_sessions':'BIGINT'"

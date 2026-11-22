@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+pipeline=$(realpath "${1:?Supply the pipeline executable}")
+fixtures=$(realpath "${2:?Supply the official fixtures directory}")
+script_dir=$(dirname "$(realpath "$0")")
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+shopt -s nullglob
+fixture_dirs=("$fixtures"/*/input)
+if [[ ${#fixture_dirs[@]} != 36 ]]; then
+    echo "Expected 36 official fixtures, found ${#fixture_dirs[@]}" >&2
+    exit 1
+fi
+for input in "${fixture_dirs[@]}"; do
+    DATA_DIR="$input" OUTPUT_DIR="$temporary/output" NCPU="${NCPU:-4}" "$pipeline"
+    if ! bash "$script_dir/check" "$temporary/output" "${input%/input}/expected" > "$temporary/diff"; then
+        cat "$temporary/diff" >&2
+        exit 1
+    fi
+    printf '%s OK\n' "$(basename "${input%/input}")"
+done
+printf 'All %d fixtures match.\n' "${#fixture_dirs[@]}"

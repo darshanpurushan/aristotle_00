@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!Makefile
+!main.cpp
+!input.hpp
+!output.hpp
+!scripts/
+scripts/*
+!scripts/fetch-arrow
