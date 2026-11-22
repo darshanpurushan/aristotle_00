@@ -20,7 +20,13 @@ Value checked(arrow::Result<Value> result) {
 inline std::unique_ptr<parquet::arrow::FileWriter> open_parquet(
     const fs::path& path, const std::shared_ptr<arrow::Schema>& schema) {
     parquet::WriterProperties::Builder options;
-    options.compression(parquet::Compression::SNAPPY);
+    // user_id / campaign_id are (nearly) unique, so dictionary encoding only costs time before
+    // it falls back to plain; statistics are never read; compression buys little on random IDs.
+    options.compression(parquet::Compression::UNCOMPRESSED);
+    options.disable_statistics();
+    options.disable_dictionary("user_id");
+    options.disable_dictionary("campaign_id");
+    options.disable_dictionary("channel");
     auto sink = checked(arrow::io::FileOutputStream::Open(path.string()));
     return checked(parquet::arrow::FileWriter::Open(
         *schema, arrow::default_memory_pool(), std::move(sink), options.build()));

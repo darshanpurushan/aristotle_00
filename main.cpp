@@ -5,21 +5,36 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
-#include <memory_resource>
 #include <tuple>
 #include <unordered_map>
 
 namespace shopping {
+using u8 = unsigned char;
 constexpr size_t shard_count = 128;
-struct Hash {
-    size_t operator()(View value) const noexcept {
-        uint64_t hash = 14695981039346656037ULL;
-        for (unsigned char byte : value) {
-            hash ^= byte;
-            hash *= 1099511628211ULL;
-        }
-        return size_t(hash);
+
+// Word-at-a-time hash (the IDs are opaque strings of 1 to ~40 bytes). Only needs to be
+// consistent inside one process; both the low bits (tables) and high bits (shards) are mixed.
+inline size_t hash_bytes(const char* p, size_t n) {
+    constexpr u64 K = 0x9E3779B97F4A7C15ULL, M = 0xff51afd7ed558ccdULL;
+    u64 h = (n + 1) * K;
+    auto load8 = [](const char* q) { u64 w; std::memcpy(&w, q, 8); return w; };
+    if (n >= 8) {
+        const char* last = p + n - 8;
+        for (; p < last; p += 8) { h = (h ^ load8(p)) * M; h ^= h >> 32; }
+        h = (h ^ load8(last)) * M; h ^= h >> 32;
+    } else if (n >= 4) {
+        u32 a, b;
+        std::memcpy(&a, p, 4); std::memcpy(&b, p + n - 4, 4);
+        h = (h ^ (u64(a) << 32 | b)) * M; h ^= h >> 32;
+    } else if (n) {
+        u64 w = u64(u8(p[0])) | u64(u8(p[n >> 1])) << 8 | u64(u8(p[n - 1])) << 16;
+        h = (h ^ w) * M; h ^= h >> 32;
     }
+    h *= K; h ^= h >> 29; h *= M; h ^= h >> 32;
+    return size_t(h);
+}
+struct Hash {
+    size_t operator()(View v) const noexcept { return hash_bytes(v.data(), v.size()); }
 };
 
 size_t shard_for(size_t hash) {
@@ -110,24 +125,6 @@ struct CanonicalUser {
     View id;
     size_t hash;
     bool linked;
-};
-
-class StandaloneUsers {
-public:
-    View retain(View id, size_t hash) {
-        auto [value, inserted] = index_.insert(id, hash, {});
-        if (inserted) {
-            auto* bytes = static_cast<char*>(storage_.allocate(id.size(), alignof(char)));
-            std::memcpy(bytes, id.data(), id.size());
-            *value = View(bytes, id.size());
-            index_.entries().back().key = *value;
-        }
-        return *value;
-    }
-
-private:
-    std::pmr::monotonic_buffer_resource storage_;
-    StringIndex<View> index_;
 };
 
 class Identities {
@@ -222,23 +219,31 @@ struct RawEvent {
 };
 struct RoutedEvent {
     View user;
+    size_t hash;
     i64 ts;
     u32 price, category;
 };
 struct RoutedClick {
     View user;
     View id;
+    size_t hash;
     i64 ts;
     u32 campaign;
 };
+// Sort keys pack (user index, time offset) into one word: 24 bits of user, 40 bits of ms.
+constexpr int key_shift = 40;
+constexpr u64 key_mask = (u64(1) << key_shift) - 1;
+constexpr u64 max_users = (u64(1) << 24) - 1;
 struct Event {
-    i64 ts;
-    u32 user, price, category;
+    u64 key;
+    u32 price, category;
+    u32 user() const { return u32(key >> key_shift); }
 };
 struct Click {
-    i64 ts;
+    u64 key;
     View id;
-    u32 user, campaign;
+    u32 campaign;
+    u32 user() const { return u32(key >> key_shift); }
 };
 
 View event_id(View line) {
@@ -257,11 +262,15 @@ View earlier_event(View left, View right) {
     return left;
 }
 
-void route_events(const std::vector<Mapping>& files, unsigned threads, i64 start, i64 end,
-                  const Identities& people, const Dimensions& dimensions,
-                  std::vector<Shards<RoutedEvent>>& routed,
-                  std::vector<StandaloneUsers>& standalone, Progress& progress) {
+struct EventScan {
     std::vector<Chunk> chunks;
+    std::vector<u64> losers;
+};
+
+// Needs no identities, so it can overlap with loading the links.
+EventScan index_events(const std::vector<Mapping>& files, unsigned threads, Progress& progress) {
+    EventScan scan;
+    auto& chunks = scan.chunks;
     for (const auto& file : files) file.add_chunks(chunks);
     std::vector<Shards<RawEvent>> raw(threads);
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
@@ -318,16 +327,22 @@ void route_events(const std::vector<Mapping>& files, unsigned threads, i64 start
         }
         for (auto& source : raw) std::vector<RawEvent>().swap(source[shard]);
     });
-    std::vector<u64> losers;
     for (auto& worker : discarded) {
-        losers.insert(losers.end(), worker.begin(), worker.end());
+        scan.losers.insert(scan.losers.end(), worker.begin(), worker.end());
         std::vector<u64>().swap(worker);
     }
-    std::sort(losers.begin(), losers.end());
+    std::sort(scan.losers.begin(), scan.losers.end());
     progress.log("deduplicate events");
+    return scan;
+}
 
-    // Revisit the input in file order. Only actual hash matches require
-    // random reads during deduplication, and routing reads whole pages.
+// The event files stay mapped until the end of the run, so routed records point straight
+// into them and no per-event copy or interning of user names is needed.
+void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
+                  const Identities& people, const Dimensions& dimensions,
+                  std::vector<Shards<RoutedEvent>>& routed) {
+    const auto& chunks = scan.chunks;
+    const auto& losers = scan.losers;
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
         Chunk chunk = chunks[index];
         u64 base = u64(index) << 32;
@@ -353,8 +368,7 @@ void route_events(const std::vector<Mapping>& files, unsigned threads, i64 start
                 return;
             }
             auto [user, hash, linked] = people.canonical(row[1]);
-            if (!linked) user = standalone[worker].retain(user, hash);
-            routed[worker][shard_for(hash)].push_back({user, ts, price, category});
+            routed[worker][shard_for(hash)].push_back({user, hash, ts, price, category});
         });
     });
 }
@@ -374,7 +388,7 @@ void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start
             if (campaign == dimensions.campaign_index.end()) return;
             auto user = people.canonical(row[1]);
             // Exact duplicate clicks contribute identically to both the winner and the union.
-            routed[worker][shard_for(user.hash)].push_back({user.id, row[0], ts, campaign->second});
+            routed[worker][shard_for(user.hash)].push_back({user.id, row[0], user.hash, ts, campaign->second});
         });
     });
 }
@@ -387,8 +401,8 @@ struct Session {
 
 class Aggregation {
 public:
-    Aggregation(const Dimensions& dimensions, int first_day, int days, fs::path output)
-        : dimensions_(dimensions), first_day_(first_day), width_(dimensions.campaigns.size()),
+    Aggregation(const Dimensions& dimensions, int first_day, int days, i64 start, fs::path output)
+        : dimensions_(dimensions), first_day_(first_day), start_(start), width_(dimensions.campaigns.size()),
           campaign_totals_(size_t(days) * width_), category_revenue_(dimensions.categories.size()),
           covered_(width_), user_rows_(std::move(output)) {}
 
@@ -415,14 +429,15 @@ public:
             day_events = day_revenue = 0;
         };
 
-        i64 previous = event->ts;
+        i64 previous = start_ + i64(event->key & key_mask);
         for (; event != end; ++event) {
-            if (sessions_.empty() || event->ts - previous > session_gap) {
-                int day = utc_day(event->ts) - first_day_;
+            i64 ts = start_ + i64(event->key & key_mask);
+            if (sessions_.empty() || ts - previous > session_gap) {
+                int day = utc_day(ts) - first_day_;
                 if (!sessions_.empty() && day != sessions_.back().day) emit_day();
-                sessions_.push_back({event->ts, 0, day});
+                sessions_.push_back({ts, 0, day});
             }
-            previous = event->ts;
+            previous = ts;
             ++day_events;
             if (event->price) {
                 sessions_.back().revenue += event->price;
@@ -435,11 +450,11 @@ public:
         emit_day();
 
         for (const Session& session : sessions_) {
-            while (click != click_end && click->ts <= session.start) {
+            while (click != click_end && click_ts(*click) <= session.start) {
                 consider_assist(*click++);
             }
             u32 campaign = 0;
-            if (winner_ && session.start - winner_->ts <= week_ms) campaign = winner_->campaign;
+            if (winner_ && session.start - click_ts(*winner_) <= week_ms) campaign = winner_->campaign;
             auto& summary = total(session.day, campaign);
             ++summary.sessions;
             summary.purchasing += session.revenue > 0;
@@ -456,18 +471,21 @@ public:
     std::vector<CampaignTotal>& totals() { return campaign_totals_; }
 
 private:
+    i64 click_ts(const Click& click) const { return start_ - week_ms + i64(click.key & key_mask); }
+
     CampaignTotal& total(int day, u32 campaign) {
         return campaign_totals_[size_t(day) * width_ + campaign];
     }
 
     void consider_assist(const Click& click) {
-        if (!winner_ || click.ts > winner_->ts ||
-            (click.ts == winner_->ts && click.id < winner_->id)) winner_ = &click;
+        const i64 ts = click_ts(click);
+        if (!winner_ || ts > click_ts(*winner_) ||
+            (ts == click_ts(*winner_) && click.id < winner_->id)) winner_ = &click;
 
         // Clicks arrive in time order, so their covered session intervals move forward.
-        while (first_ < sessions_.size() && sessions_[first_].start < click.ts) ++first_;
+        while (first_ < sessions_.size() && sessions_[first_].start < ts) ++first_;
         last_ = std::max(last_, first_);
-        while (last_ < sessions_.size() && sessions_[last_].start - click.ts <= week_ms) ++last_;
+        while (last_ < sessions_.size() && sessions_[last_].start - ts <= week_ms) ++last_;
         size_t& covered = covered_[click.campaign];
         size_t begin = std::max(first_, covered);
         if (begin >= last_) return;
@@ -480,6 +498,7 @@ private:
 
     const Dimensions& dimensions_;
     int first_day_;
+    i64 start_;
     size_t width_;
     std::vector<CampaignTotal> campaign_totals_;
     std::vector<i64> category_revenue_;
@@ -491,7 +510,7 @@ private:
     UserWriter user_rows_;
 };
 
-void aggregate_shard(size_t shard, std::vector<Shards<RoutedEvent>>& event_shards,
+void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& event_shards,
                      std::vector<Shards<RoutedClick>>& click_shards, Aggregation& output) {
     StringIndex<u32> users;
     std::vector<View> names;
@@ -501,42 +520,44 @@ void aggregate_shard(size_t shard, std::vector<Shards<RoutedEvent>>& event_shard
     events.reserve(count);
     for (auto& source : event_shards) {
         for (const RoutedEvent& row : source[shard]) {
-            auto [entry, inserted] = users.insert(row.user, Hash{}(row.user), names.size());
-            if (inserted) names.push_back(row.user);
-            events.push_back({row.ts, *entry, row.price, row.category});
+            auto [entry, inserted] = users.insert(row.user, row.hash, names.size());
+            if (inserted) {
+                if (names.size() >= max_users - 1) throw std::runtime_error("Too many people in one shard");
+                names.push_back(row.user);
+            }
+            u64 offset = u64(row.ts - start);
+            events.push_back({(u64(*entry) << key_shift) | offset, row.price, row.category});
         }
         std::vector<RoutedEvent>().swap(source[shard]);
     }
 
+    const i64 click_base = start - week_ms;
     std::vector<Click> clicks;
     size_t click_count = 0;
     for (const auto& source : click_shards) click_count += source[shard].size();
     clicks.reserve(click_count + 1);
     for (auto& source : click_shards) {
         for (const RoutedClick& row : source[shard]) {
-            auto user = users.find(row.user, Hash{}(row.user));
-            if (user) clicks.push_back({row.ts, row.id, *user, row.campaign});
+            auto user = users.find(row.user, row.hash);
+            if (user) clicks.push_back({(u64(*user) << key_shift) | u64(row.ts - click_base), row.id, row.campaign});
         }
         std::vector<RoutedClick>().swap(source[shard]);
     }
 
-    auto order = [](const auto& a, const auto& b) {
-        return a.user != b.user ? a.user < b.user : a.ts < b.ts;
-    };
-    std::sort(events.begin(), events.end(), order);
-    std::sort(clicks.begin(), clicks.end(), order);
-    // A nonempty backing array makes equal empty-range pointers well-defined.
-    clicks.push_back({0, {}, absent, 0});
+    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) { return a.key < b.key; });
+    std::sort(clicks.begin(), clicks.end(), [](const Click& a, const Click& b) { return a.key < b.key; });
+    // Sentinel: user index max_users sorts after every real user.
+    clicks.push_back({~u64(0), {}, 0});
 
     auto click = clicks.data();
     const auto* event_end = events.empty() ? events.data() : events.data() + events.size();
     for (auto event = events.data(); event != event_end;) {
-        u32 user = event->user;
+        u32 user = event->user();
         auto next_event = event + 1;
-        while (next_event != event_end && next_event->user == user) ++next_event;
-        while (click->user < user) ++click;
+        while (next_event != event_end && next_event->user() == user) ++next_event;
+        while (click->user() < user) ++click;
         auto next_click = click;
-        while (next_click->user == user) ++next_click;
+        while (next_click->user() == user) ++next_click;
         output.person(names[user], event, next_event, click, next_click);
         event = next_event;
         click = next_click;
@@ -567,26 +588,46 @@ int run() {
     auto click_files = files(data / "clicks");
     auto link_files = files(data / "links");
     Dimensions dimensions(data);
-    Identities people(link_files);
-    progress.log("load links and dimensions");
+
+    // Union-find over the links is serial; run it while the event files are indexed.
+    std::unique_ptr<Identities> people_ptr;
+    std::exception_ptr link_failure;
+    EventScan scan;
+    {
+        std::jthread link_loader([&] {
+            try { people_ptr = std::make_unique<Identities>(link_files); }
+            catch (...) { link_failure = std::current_exception(); }
+        });
+        scan = index_events(event_files, threads, progress);
+    }
+    if (link_failure) std::rethrow_exception(link_failure);
+    const Identities& people = *people_ptr;
+    progress.log("load links");
 
     std::vector<Shards<RoutedEvent>> event_shards(threads);
     std::vector<Shards<RoutedClick>> click_shards(threads);
-    std::vector<StandaloneUsers> standalone(threads);
-    route_events(event_files, threads, start, end, people, dimensions, event_shards, standalone, progress);
-    // The routed records now reference stable names independent of the event files.
-    event_files.clear();
+    route_events(scan, threads, start, end, people, dimensions, event_shards);
     progress.log("route events");
     route_clicks(click_files, threads, start, end, people, dimensions, click_shards);
     progress.log("route clicks");
 
+    // Largest shards first, so whale shards do not become the tail of the run.
+    std::vector<size_t> order(shard_count);
+    std::vector<size_t> weight(shard_count);
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+        order[shard] = shard;
+        for (unsigned w = 0; w < threads; ++w)
+            weight[shard] += event_shards[w][shard].size() + click_shards[w][shard].size();
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return weight[a] > weight[b]; });
+
     std::vector<std::unique_ptr<Aggregation>> workers;
     for (unsigned i = 0; i < threads; ++i) {
         workers.push_back(std::make_unique<Aggregation>(
-            dimensions, first_day, days, output / "user_daily" / ("shopping-" + std::to_string(i) + ".parquet")));
+            dimensions, first_day, days, start, output / "user_daily" / ("shopping-" + std::to_string(i) + ".parquet")));
     }
     parallel(shard_count, threads, [&](size_t shard, unsigned worker) {
-        aggregate_shard(shard, event_shards, click_shards, *workers[worker]);
+        aggregate_shard(order[shard], start, event_shards, click_shards, *workers[worker]);
     });
     std::vector<CampaignTotal> totals(size_t(days) * dimensions.campaigns.size());
     for (unsigned worker = 0; worker < threads; ++worker) {

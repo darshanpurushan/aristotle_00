@@ -62,17 +62,22 @@ inline i64 timestamp(View s) {
         i64 value = decimal(s, std::numeric_limits<i64>::max());
         return value < 0 ? invalid_time : value;
     }
-    auto pair = [&](size_t i) {
-        unsigned a = unsigned(s[i]) - '0';
-        unsigned b = unsigned(s[i + 1]) - '0';
-        return a < 10 && b < 10 ? int(a * 10 + b) : -1;
-    };
-    int year = pair(0) * 100 + pair(2);
-    int month = pair(5), date = pair(8), hour = pair(11), minute = pair(14), second = pair(17);
-    if (year < 1 || month < 1 || month > 12 || date < 1 ||
-        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
-        return invalid_time;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+    // Every digit position must hold an ASCII digit (OR the "not a digit" flags together).
+    unsigned bad = 0;
+    for (int i : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18}) bad |= (unsigned(p[i]) - '0') > 9;
+    if (s.size() == 25) {
+        for (int i : {20, 21, 23, 24}) bad |= (unsigned(p[i]) - '0') > 9;
     }
+    if (bad) return invalid_time;
+    int year = (p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + (p[3] - '0');
+    int month = (p[5] - '0') * 10 + p[6] - '0';
+    int date = (p[8] - '0') * 10 + p[9] - '0';
+    int hour = (p[11] - '0') * 10 + p[12] - '0';
+    int minute = (p[14] - '0') * 10 + p[15] - '0';
+    int second = (p[17] - '0') * 10 + p[18] - '0';
+    if (year < 1 || month < 1 || month > 12 || date < 1 ||
+        hour > 23 || minute > 59 || second > 59) return invalid_time;
     bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     constexpr int lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     constexpr int offsets[] = {0,31,59,90,120,151,181,212,243,273,304,334};
@@ -81,9 +86,9 @@ inline i64 timestamp(View s) {
     if (s.size() == 20) {
         if (s[19] != 'Z') return invalid_time;
     } else {
-        int h = pair(20), m = pair(23);
-        if ((s[19] != '+' && s[19] != '-') || s[22] != ':' ||
-            h < 0 || h > 23 || m < 0 || m > 59) return invalid_time;
+        int h = (p[20] - '0') * 10 + p[21] - '0';
+        int m = (p[23] - '0') * 10 + p[24] - '0';
+        if ((s[19] != '+' && s[19] != '-') || s[22] != ':' || h > 23 || m > 59) return invalid_time;
         offset = (h * 60 + m) * (s[19] == '-' ? -1 : 1);
     }
     int y = year - 1;
