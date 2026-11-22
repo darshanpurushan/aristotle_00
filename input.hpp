@@ -55,6 +55,24 @@ inline i64 decimal(View field, i64 limit) {
 }
 
 inline i64 timestamp(View s) {
+#ifdef __AVX2__
+    if (s.size() == 13) {
+        // Split the digits into eight and five, padding the second group on the
+        // left. Packed multiply-add reduces pairs, then groups of four and eight.
+        u64 first, last;
+        std::memcpy(&first, s.data(), 8);
+        std::memcpy(&last, s.data() + 5, 8);
+        last = (last & ~u64(0xffffff)) | 0x303030;
+        auto bytes = _mm_set_epi64x(last, first);
+        auto digits = _mm_sub_epi8(bytes, _mm_set1_epi8('0'));
+        auto bounded = _mm_min_epu8(digits, _mm_set1_epi8(9));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(digits, bounded)) != 0xffff) return invalid_time;
+        auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        auto fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+        auto groups = _mm_madd_epi16(_mm_packus_epi32(fours, fours), _mm_set1_epi32(0x00012710));
+        return i64(_mm_cvtsi128_si32(groups)) * 100000 + _mm_extract_epi32(groups, 1);
+    }
+#endif
     if (s.size() != 20 && s.size() != 25) {
         i64 value = decimal(s, std::numeric_limits<i64>::max());
         return value < 0 ? invalid_time : value;
@@ -127,8 +145,7 @@ public:
             u64 prefix; u16 suffix;
             std::memcpy(&prefix, digits, 8);
             std::memcpy(&suffix, digits + 8, 2);
-            auto slot = slot_for(prefix, suffix);
-            while (days_[slot].prefix) slot = (slot + 1) & (table_size - 1);
+            auto slot = date_slot(digits);
             days_[slot] = {prefix, suffix, day};
         }
     }
@@ -174,26 +191,24 @@ public:
 private:
     using u16 = uint16_t;
     struct DateSlot {u64 prefix = 0; u16 suffix = 0; int day = 0;};
-    static constexpr unsigned table_size = 128;
+    static constexpr unsigned table_size = 512;
     static constexpr int missing = std::numeric_limits<int>::min();
     std::array<DateSlot, table_size> days_{};
-    static unsigned slot_for(u64 prefix, u16 suffix) {
-        u64 mixed = prefix ^ (u64(suffix) << 48);
-        mixed ^= mixed >> 32;
-        mixed *= 0x9E3779B97F4A7C15ULL;
-        return unsigned(mixed >> 57);
+    static unsigned date_slot(const char* p) {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(p);
+        unsigned month = bytes[5] * 10 + bytes[6] - 11 * '0';
+        unsigned day = bytes[8] * 10 + bytes[9] - 11 * '0';
+        return (month * 32 + day) & (table_size - 1);
     }
     int date(const char* p) const {
         u64 prefix; u16 suffix;
         std::memcpy(&prefix, p, 8);
         std::memcpy(&suffix, p + 8, 2);
-        auto slot = slot_for(prefix, suffix);
-        for (;;) {
-            const auto& entry = days_[slot];
-            if (!entry.prefix) return missing;
-            if (entry.prefix == prefix && entry.suffix == suffix) return entry.day;
-            slot = (slot + 1) & (table_size - 1);
-        }
+        // The cache spans fewer than 365 days, so valid month/day pairs are unique.
+        // Compare all date bytes to reject invalid input and dates outside the cache.
+        const auto& entry = days_[date_slot(p)];
+        return entry.prefix == prefix && entry.suffix == suffix && entry.prefix
+            ? entry.day : missing;
     }
 };
 
@@ -238,6 +253,8 @@ bool short_fields(View line, std::array<View, N>& row) {
     if (position < line.size()) {
         scan(line.data() + line.size() - 32, position + 32 - line.size(), position);
     }
+    unsigned quote_count = __builtin_popcountll(u64(quotes)) + __builtin_popcountll(u64(quotes >> 64));
+    unsigned outer_quotes = 0;
     unsigned previous = 0;
     for (size_t column = 0; column < N; ++column) {
         unsigned next = line.size();
@@ -247,18 +264,17 @@ bool short_fields(View line, std::array<View, N>& row) {
             next = low ? __builtin_ctzll(low) : 64 + __builtin_ctzll(u64(commas >> 64));
             commas &= commas - 1;
         }
-        unsigned start = previous;
-        unsigned length = next - start;
-        if (length && line[start] == '"') {
-            if (length < 2 || line[next - 1] != '"') return false;
-            quotes &= ~((Mask(1) << start) | (Mask(1) << (next - 1)));
-            ++start;
-            length -= 2;
-        }
-        row[column] = View(line.data() + start, length);
+        unsigned length = next - previous;
+        // A field may have two outer quotes or none. Counting all punctuation
+        // also rejects any interior quote, including in an ignored field.
+        unsigned opening = length && line[previous] == '"';
+        unsigned closing = length && line[next - 1] == '"';
+        if (opening != closing || length < 2 * opening) return false;
+        outer_quotes += 2 * opening;
+        row[column] = View(line.data() + previous + opening, length - 2 * opening);
         previous = next + 1;
     }
-    return !commas && !quotes;
+    return !commas && quote_count == outer_quotes;
 }
 #endif
 

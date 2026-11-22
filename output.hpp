@@ -60,13 +60,15 @@ public:
     explicit UserWriter(fs::path path) : path_(std::move(path)) {}
 
     void append(View user, int day, i64 sessions, i64 events, i64 revenue, const View* category) {
-        checked(users_.Append(user));
-        checked(days_.Append(day));
-        checked(sessions_.Append(sessions));
-        checked(events_.Append(events));
-        checked(revenues_.Append(revenue));
-        checked(category ? categories_.Append(*category) : categories_.AppendNull());
-        if (users_.length() == 65'536) flush();
+        if (users_.length() == 0) reserve_batch();
+        append_string(users_, user);
+        days_.UnsafeAppend(day);
+        sessions_.UnsafeAppend(sessions);
+        events_.UnsafeAppend(events);
+        revenues_.UnsafeAppend(revenue);
+        if (category) append_string(categories_, *category);
+        else categories_.UnsafeAppendNull();
+        if (users_.length() == batch_size) flush();
     }
 
     void close(bool require_file) {
@@ -75,6 +77,26 @@ public:
     }
 
 private:
+    static constexpr int64_t batch_size = 65'536;
+
+    static void append_string(arrow::StringBuilder& builder, View value) {
+        if (value.size() > size_t(builder.value_data_capacity() - builder.value_data_length())) {
+            checked(builder.ReserveData(value.size()));
+        }
+        builder.UnsafeAppend(value);
+    }
+
+    void reserve_batch() {
+        checked(users_.Reserve(batch_size));
+        checked(users_.ReserveData(batch_size * 16));
+        checked(days_.Reserve(batch_size));
+        checked(sessions_.Reserve(batch_size));
+        checked(events_.Reserve(batch_size));
+        checked(revenues_.Reserve(batch_size));
+        checked(categories_.Reserve(batch_size));
+        checked(categories_.ReserveData(batch_size * 4));
+    }
+
     void flush() {
         if (!writer_) writer_ = open_parquet(path_, user_schema);
         auto length = users_.length();

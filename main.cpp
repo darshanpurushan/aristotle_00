@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <tuple>
@@ -161,36 +162,78 @@ struct CanonicalUser {
 
 class Identities {
 public:
-    explicit Identities(const std::vector<Mapping>& links) {
+    explicit Identities(const std::vector<Mapping>& links, unsigned threads) {
         std::vector<Chunk> chunks;
         for (const auto& file : links) file.add_chunks(chunks);
-        for (Chunk chunk : chunks) {
-            for_lines(chunk, [&](View line) {
+        struct Edge { u32 a, b; };
+        struct Endpoint { View id; size_t hash; u32* node; };
+        std::vector<std::deque<Edge>> edges(threads);
+        std::vector<Shards<Endpoint>> endpoints(threads);
+        parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
+            auto add = [&](View id, u32* node) {
+                size_t hash = Hash{}(id);
+                endpoints[worker][shard_for(hash)].push_back({id, hash, node});
+            };
+            for_lines(chunks[index], [&](View line) {
                 std::array<View, 2> row;
                 if (!fields(line, row) || row[0].empty() || row[1].empty()) return;
-                u32 a = root(intern(row[0])), b = root(intern(row[1]));
-                if (a == b) return;
+                Edge& edge = edges[worker].emplace_back();
+                add(row[0], &edge.a);
+                add(row[1], &edge.b);
+            });
+        });
+        parallel(shard_count, threads, [&](size_t shard, unsigned) {
+            auto& index = nodes_[shard];
+            for (auto& source : endpoints) {
+                for (const auto& entry : source[shard]) {
+                    auto [person, inserted] = index.insert(entry.id, entry.hash, {u32(index.entries().size()), {}, 0});
+                    *entry.node = person->node * shard_count + shard;
+                }
+                std::vector<Endpoint>().swap(source[shard]);
+            }
+        });
+
+        // Translate shard-local IDs to a dense integer space for union-find.
+        std::array<u32, shard_count> offsets{};
+        for (size_t shard = 0; shard < shard_count; ++shard) {
+            offsets[shard] = parent_.size();
+            for (const auto& entry : nodes_[shard].entries()) {
+                parent_.push_back(parent_.size());
+                size_.push_back(1);
+                minimum_.emplace_back(entry.key, entry.hash);
+            }
+        }
+        auto global = [&](u32 node) { return offsets[node % shard_count] + node / shard_count; };
+        for (const auto& source : edges) {
+            for (const Edge& edge : source) {
+                u32 a = root(global(edge.a)), b = root(global(edge.b));
+                if (a == b) continue;
                 if (size_[a] < size_[b]) std::swap(a, b);
                 parent_[b] = a;
                 size_[a] += size_[b];
                 if (minimum_[b].first < minimum_[a].first) minimum_[a] = minimum_[b];
-            });
+            }
         }
-        // Node ids equal entry positions; resolve every entry to its person once.
-        for (auto& entry : nodes_.entries()) {
-            auto [name, hash] = minimum_[root(entry.value.node)];
-            entry.value.name = name;
-            entry.value.hash = hash;
-        }
+        for (u32 node = 0; node < parent_.size(); ++node) parent_[node] = root(node);
+        parallel(shard_count, threads, [&](size_t shard, unsigned) {
+            for (auto& entry : nodes_[shard].entries()) {
+                auto [name, hash] = minimum_[parent_[offsets[shard] + entry.value.node]];
+                entry.value.name = name;
+                entry.value.hash = hash;
+            }
+        });
+        std::vector<u32>().swap(parent_);
+        std::vector<u32>().swap(size_);
+        std::vector<std::pair<View, size_t>>().swap(minimum_);
     }
 
     CanonicalUser canonical(View user) const { return canonical(user, Hash{}(user)); }
-    void prefetch_slot(size_t hash) const { nodes_.prefetch_slot(hash); }
-    void prefetch_entry(size_t hash) const { nodes_.prefetch_entry(hash); }
-    void prefetch_key(size_t hash) const { nodes_.prefetch_key(hash); }
+    void prefetch_slot(size_t hash) const { nodes_[shard_for(hash)].prefetch_slot(hash); }
+    void prefetch_entry(size_t hash) const { nodes_[shard_for(hash)].prefetch_entry(hash); }
+    void prefetch_key(size_t hash) const { nodes_[shard_for(hash)].prefetch_key(hash); }
 
     CanonicalUser canonical(View user, size_t hash) const {
-        auto person = nodes_.find(user, hash);
+        auto person = nodes_[shard_for(hash)].find(user, hash);
         if (!person) return {user, hash, false};
         return {person->name, person->hash, true};
     }
@@ -202,17 +245,6 @@ private:
         size_t hash;
     };
 
-    u32 intern(View id) {
-        size_t hash = Hash{}(id);
-        auto [person, inserted] = nodes_.insert(id, hash, {u32(parent_.size()), {}, 0});
-        if (inserted) {
-            parent_.push_back(person->node);
-            size_.push_back(1);
-            minimum_.emplace_back(id, hash);
-        }
-        return person->node;
-    }
-
     u32 root(u32 node) {
         while (parent_[node] != node) {
             parent_[node] = parent_[parent_[node]];
@@ -221,7 +253,7 @@ private:
         return node;
     }
 
-    StringIndex<Person> nodes_;
+    std::array<StringIndex<Person>, shard_count> nodes_;
     std::vector<u32> parent_, size_;
     std::vector<std::pair<View, size_t>> minimum_;
 };
@@ -293,6 +325,23 @@ struct Click {
 };
 
 View event_id(View line) {
+#ifdef __AVX2__
+    if (line.size() >= 32) {
+        const char* data = line.data();
+        auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
+        unsigned commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(',')));
+        if (commas) {
+            unsigned length = __builtin_ctz(commas);
+            unsigned quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8('"')));
+            quotes &= (1u << length) - 1;
+            if (!quotes) return View(data, length);
+            if (length >= 2 && quotes == (1u | (1u << (length - 1)))) {
+                return View(data + 1, length - 2);
+            }
+            return {};
+        }
+    }
+#endif
     View id = line.substr(0, line.find(','));
     return unquote(id) ? id : View{};
 }
@@ -309,6 +358,10 @@ View earlier_event(View left, View right) {
 }
 
 struct EventScan {
+    // A chunk is split at the first newline at or after 2 MiB. Its last row
+    // can be longer, but every row start still fits in 22 bits.
+    static constexpr unsigned offset_bits = 22;
+    static constexpr u64 offset_mask = (u64{1} << offset_bits) - 1;
     std::vector<Chunk> chunks;
     std::vector<u64> losers;
 };
@@ -318,6 +371,11 @@ EventScan index_events(const std::vector<Mapping>& files, unsigned threads, Prog
     EventScan scan;
     auto& chunks = scan.chunks;
     for (const auto& file : files) file.add_chunks(chunks);
+    constexpr unsigned location_bits = 42;
+    constexpr u64 location_mask = (u64{1} << location_bits) - 1;
+    if (chunks.size() >= (u64{1} << (location_bits - EventScan::offset_bits))) {
+        throw std::runtime_error("Too many event chunks");
+    }
     std::vector<Shards<RawEvent>> raw(threads);
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
         Chunk chunk = chunks[index];
@@ -325,15 +383,15 @@ EventScan index_events(const std::vector<Mapping>& files, unsigned threads, Prog
             View id = event_id(line);
             if (id.empty()) return;
             size_t hash = Hash{}(id);
-            u64 location = (u64(index) << 32) | u32(line.data() - chunk.start);
+            u64 location = (u64(index) << EventScan::offset_bits) | u64(line.data() - chunk.start);
             raw[worker][shard_for(hash)].push_back({hash, location});
         });
     });
     progress.log("index events");
 
     auto line_at = [&](u64 location) {
-        Chunk chunk = chunks[location >> 32];
-        const char* start = chunk.start + u32(location);
+        Chunk chunk = chunks[location >> EventScan::offset_bits];
+        const char* start = chunk.start + (location & EventScan::offset_mask);
         return View(start, line_end(start, chunk.end) - start);
     };
     std::vector<std::vector<u64>> discarded(threads);
@@ -343,26 +401,30 @@ EventScan index_events(const std::vector<Mapping>& files, unsigned threads, Prog
         if (!row_count) return;
         size_t capacity = 2;
         while (capacity < row_count + row_count / 2) capacity *= 2;
-        std::vector<const RawEvent*> index(capacity);
+        // A fingerprint filters probes. Matching fingerprints still compare
+        // full IDs, so the packed table never treats a collision as a duplicate.
+        std::vector<u64> index(capacity);
         for (auto& source : raw) {
             for (const RawEvent& candidate : source[shard]) {
                 size_t slot = candidate.hash & (capacity - 1);
+                u64 tag = candidate.hash & ~location_mask;
                 for (;;) {
-                    const RawEvent* previous = index[slot];
+                    auto& previous = index[slot];
                     if (!previous) {
-                        index[slot] = &candidate;
+                        previous = tag | (candidate.location + 1);
                         break;
                     }
-                    if (previous->hash == candidate.hash) {
-                        View left = line_at(previous->location);
+                    if ((previous & ~location_mask) == tag) {
+                        u64 previous_location = (previous & location_mask) - 1;
+                        View left = line_at(previous_location);
                         View right = line_at(candidate.location);
                         if (event_id(left) == event_id(right)) {
                             View winner = earlier_event(left, right);
                             if (winner.data() == left.data()) {
                                 discarded[worker].push_back(candidate.location);
                             } else {
-                                discarded[worker].push_back(previous->location);
-                                index[slot] = &candidate;
+                                discarded[worker].push_back(previous_location);
+                                previous = tag | (candidate.location + 1);
                             }
                             break;
                         }
@@ -391,7 +453,7 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
     const auto& losers = scan.losers;
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
         Chunk chunk = chunks[index];
-        u64 base = u64(index) << 32;
+        u64 base = u64(index) << EventScan::offset_bits;
         auto skip = std::lower_bound(losers.begin(), losers.end(), base);
         struct Pending {
             View user;
@@ -413,7 +475,7 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
             held = 0;
         };
         for_lines(chunk, [&](View line) {
-            u64 location = base | u32(line.data() - chunk.start);
+            u64 location = base | u64(line.data() - chunk.start);
             if (skip != losers.end() && *skip == location) {
                 ++skip;
                 return;
@@ -767,16 +829,18 @@ int run() {
     auto link_files = files(data / "links");
     Dimensions dimensions(data);
 
-    // Union-find over the links is serial; run it while the event files are indexed.
+    // Link indexing and event deduplication are independent.
     std::unique_ptr<Identities> people_ptr;
     std::exception_ptr link_failure;
     EventScan scan;
     {
+        const unsigned link_threads = std::max(1u, threads / 3);
+        const unsigned event_threads = std::max(1u, threads - link_threads);
         std::jthread link_loader([&] {
-            try { people_ptr = std::make_unique<Identities>(link_files); }
+            try { people_ptr = std::make_unique<Identities>(link_files, link_threads); }
             catch (...) { link_failure = std::current_exception(); }
         });
-        scan = index_events(event_files, threads, progress);
+        scan = index_events(event_files, event_threads, progress);
     }
     if (link_failure) std::rethrow_exception(link_failure);
     const Identities& people = *people_ptr;
