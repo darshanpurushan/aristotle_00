@@ -10,7 +10,7 @@
 
 namespace shopping {
 using u8 = unsigned char;
-constexpr size_t shard_count = 128;
+constexpr size_t shard_count = 64;
 
 // Word-at-a-time hash (the IDs are opaque strings of 1 to ~40 bytes). Only needs to be
 // consistent inside one process; both the low bits (tables) and high bits (shards) are mixed.
@@ -176,35 +176,65 @@ public:
                 if (minimum_[b].first < minimum_[a].first) minimum_[a] = minimum_[b];
             });
         }
-        // Node ids equal entry positions; resolve every entry to its person once.
+        // Resolve all linked IDs and build a single-cache-line lookup table.
+        // The expensive union-find index is never used again after this point.
+        const auto& all = nodes_.entries();
+        size_t capacity = 16;
+        while (capacity < all.size() * 2) capacity *= 2;
+        flattened_.resize(capacity);
+        const size_t mask = capacity - 1;
         for (auto& entry : nodes_.entries()) {
-            auto [name, hash] = minimum_[root(entry.value.node)];
-            entry.value.name = name;
-            entry.value.hash = hash;
+            auto [name, root_hash] = minimum_[root(entry.value.node)];
+            size_t slot = entry.hash & mask;
+            while (flattened_[slot].key_data) slot = (slot + 1) & mask;
+            flattened_[slot] = {entry.key.data(), name.data(), entry.hash,
+                                root_hash, u32(entry.key.size()), u32(name.size())};
         }
+        nodes_ = StringIndex<Person>{};
+        parent_ = {}; size_ = {}; minimum_ = {};
     }
 
     CanonicalUser canonical(View user) const { return canonical(user, Hash{}(user)); }
-    void prefetch_slot(size_t hash) const { nodes_.prefetch_slot(hash); }
-    void prefetch_entry(size_t hash) const { nodes_.prefetch_entry(hash); }
-    void prefetch_key(size_t hash) const { nodes_.prefetch_key(hash); }
+    void prefetch_slot(size_t hash) const {
+        if (!flattened_.empty()) __builtin_prefetch(&flattened_[hash & (flattened_.size() - 1)]);
+    }
+    void prefetch_entry(size_t hash) const {
+        if (flattened_.empty()) return;
+        const FlatSlot& slot = flattened_[hash & (flattened_.size() - 1)];
+        if (slot.hash == hash && slot.key_data) __builtin_prefetch(slot.key_data);
+    }
+    void prefetch_key(size_t) const {}
 
     CanonicalUser canonical(View user, size_t hash) const {
-        auto person = nodes_.find(user, hash);
-        if (!person) return {user, hash, false};
-        return {person->name, person->hash, true};
+        if (flattened_.empty()) return {user, hash, false};
+        size_t slot = hash & (flattened_.size() - 1);
+        for (;;) {
+            const FlatSlot& current = flattened_[slot];
+            if (!current.key_data) return {user, hash, false};
+            if (current.hash == hash && current.key_length == user.size() &&
+                std::memcmp(current.key_data, user.data(), user.size()) == 0) {
+                return {{current.name_data, current.name_length}, current.person_hash, true};
+            }
+            slot = (slot + 1) & (flattened_.size() - 1);
+        }
     }
 
 private:
+    struct FlatSlot {
+        const char* key_data = nullptr;
+        const char* name_data = nullptr;
+        size_t hash = 0;
+        size_t person_hash = 0;
+        u32 key_length = 0, name_length = 0;
+    };
+    static_assert(sizeof(FlatSlot) == 40);
     struct Person {
         u32 node;
-        View name;
-        size_t hash;
     };
 
     u32 intern(View id) {
         size_t hash = Hash{}(id);
-        auto [person, inserted] = nodes_.insert(id, hash, {u32(parent_.size()), {}, 0});
+        auto [person, inserted] = nodes_.insert(id, hash, {u32(parent_.size())});
         if (inserted) {
             parent_.push_back(person->node);
             size_.push_back(1);
@@ -222,6 +252,7 @@ private:
     }
 
     StringIndex<Person> nodes_;
+    std::vector<FlatSlot> flattened_;
     std::vector<u32> parent_, size_;
     std::vector<std::pair<View, size_t>> minimum_;
 };
@@ -263,19 +294,29 @@ struct RawEvent {
     size_t hash;
     u64 location;
 };
+// A 14-day window (including the preceding week of clicks) fits in 32-bit
+// millisecond offsets. A 64-bit variant remains available for longer fixtures.
+template<class Stamp>
 struct RoutedEvent {
-    View user;
+    const char* user_bytes;
     size_t hash;
-    i64 ts;
-    u32 price, category;
+    Stamp offset;
+    u32 user_length, price, category;
+    View user() const { return {user_bytes, user_length}; }
 };
+template<class Stamp>
 struct RoutedClick {
-    View user;
-    View id;
+    const char* user_bytes;
+    const char* id_bytes;
     size_t hash;
-    i64 ts;
-    u32 campaign;
+    Stamp offset;
+    u32 user_length, id_length, campaign;
+    View user() const { return {user_bytes, user_length}; }
+    View id() const { return {id_bytes, id_length}; }
 };
+static_assert(sizeof(RoutedEvent<u32>) == 32);
+static_assert(sizeof(RoutedClick<u32>) == 40);
+
 // Sort keys pack (user index, time offset) into one word: 24 bits of user, 40 bits of ms.
 constexpr int key_shift = 40;
 constexpr u64 key_mask = (u64(1) << key_shift) - 1;
@@ -384,9 +425,10 @@ EventScan index_events(const std::vector<Mapping>& files, unsigned threads, Prog
 
 // The event files stay mapped until the end of the run, so routed records point straight
 // into them and no per-event copy or interning of user names is needed.
+template<class Stamp>
 void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
                   const Identities& people, const Dimensions& dimensions, const FastTimestamp& parser,
-                  std::vector<Shards<RoutedEvent>>& routed) {
+                  std::vector<Shards<RoutedEvent<Stamp>>>& routed) {
     const auto& chunks = scan.chunks;
     const auto& losers = scan.losers;
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
@@ -408,7 +450,8 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
             for (size_t i = 0; i < held; ++i) {
                 const Pending& p = pending[i];
                 auto person = people.canonical(p.user, p.hash);
-                routed[worker][shard_for(person.hash)].push_back({person.id, person.hash, p.ts, p.price, p.category});
+                routed[worker][shard_for(person.hash)].push_back({person.id.data(), person.hash,
+                    Stamp(p.ts - start), u32(person.id.size()), p.price, p.category});
             }
             held = 0;
         };
@@ -441,9 +484,10 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
     });
 }
 
+template<class Stamp>
 void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start, i64 end,
                   const Identities& people, const Dimensions& dimensions, const FastTimestamp& parser,
-                  std::vector<Shards<RoutedClick>>& routed) {
+                  std::vector<Shards<RoutedClick<Stamp>>>& routed) {
     std::vector<Chunk> chunks;
     for (const auto& file : files) file.add_chunks(chunks);
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
@@ -463,7 +507,8 @@ void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start
                 const Pending& p = pending[i];
                 auto person = people.canonical(p.user, p.hash);
                 // Exact duplicate clicks contribute identically to both the winner and the union.
-                routed[worker][shard_for(person.hash)].push_back({person.id, p.id, person.hash, p.ts, p.campaign});
+                routed[worker][shard_for(person.hash)].push_back({person.id.data(), p.id.data(), person.hash,
+                    Stamp(p.ts - start + week_ms), u32(person.id.size()), u32(p.id.size()), p.campaign});
             }
             held = 0;
         };
@@ -669,16 +714,31 @@ void group_by_user(std::vector<Row>& rows, size_t users) {
                     continue;
                 }
             }
-            std::sort(sorted.begin() + begin, sorted.begin() + finish,
-                      [](const Row& a, const Row& b) { return a.key < b.key; });
+            if (finish - begin <= 32) {
+                Row* ptr = sorted.data() + begin;
+                const size_t len = finish - begin;
+                for (size_t j = 1; j < len; ++j) {
+                    Row value = ptr[j];
+                    size_t k = j;
+                    while (k && value.key < ptr[k-1].key) {
+                        ptr[k] = ptr[k-1];
+                        --k;
+                    }
+                    ptr[k] = value;
+                }
+            } else {
+                std::sort(sorted.begin() + begin, sorted.begin() + finish,
+                          [](const Row& a, const Row& b) { return a.key < b.key; });
+            }
         }
 
     }
     rows.swap(sorted);
 }
 
-void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& event_shards,
-                     std::vector<Shards<RoutedClick>>& click_shards, Aggregation& output) {
+template<class Stamp>
+void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent<Stamp>>>& event_shards,
+                     std::vector<Shards<RoutedClick<Stamp>>>& click_shards, Aggregation& output) {
     StringIndex<u32> users;
     std::vector<View> names;
     std::vector<Event> events;
@@ -690,22 +750,21 @@ void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& 
     for (auto& source : event_shards) {
         const auto& rows = source[shard];
         for (size_t i = 0; i < rows.size(); ++i) {
-            if (i + ahead < rows.size()) __builtin_prefetch(rows[i + ahead].user.data());
-            const RoutedEvent& row = rows[i];
-            auto [entry, inserted] = users.insert(row.user, row.hash, names.size());
+            if (i + ahead < rows.size()) __builtin_prefetch(rows[i + ahead].user_bytes);
+            const RoutedEvent<Stamp>& row = rows[i];
+            auto [entry, inserted] = users.insert(row.user(), row.hash, names.size());
             if (inserted) {
                 if (names.size() >= max_users - 1) throw std::runtime_error("Too many people in one shard");
-                View stored = arena.copy(row.user);
+                View stored = arena.copy(row.user());
                 users.entries().back().key = stored;
                 names.push_back(stored);
             }
-            u64 offset = u64(row.ts - start);
+            u64 offset = u64(row.offset);
             events.push_back({(u64(*entry) << key_shift) | offset, row.price, row.category});
         }
-        std::vector<RoutedEvent>().swap(source[shard]);
+        std::vector<RoutedEvent<Stamp>>().swap(source[shard]);
     }
 
-    const i64 click_base = start - week_ms;
     std::vector<Click> clicks;
     size_t click_count = 0;
     for (const auto& source : click_shards) click_count += source[shard].size();
@@ -713,12 +772,12 @@ void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& 
     for (auto& source : click_shards) {
         const auto& rows = source[shard];
         for (size_t i = 0; i < rows.size(); ++i) {
-            if (i + ahead < rows.size()) __builtin_prefetch(rows[i + ahead].user.data());
-            const RoutedClick& row = rows[i];
-            auto user = users.find(row.user, row.hash);
-            if (user) clicks.push_back({(u64(*user) << key_shift) | u64(row.ts - click_base), row.id, row.campaign});
+            if (i + ahead < rows.size()) __builtin_prefetch(rows[i + ahead].user_bytes);
+            const RoutedClick<Stamp>& row = rows[i];
+            auto user = users.find(row.user(), row.hash);
+            if (user) clicks.push_back({(u64(*user) << key_shift) | u64(row.offset), row.id(), row.campaign});
         }
-        std::vector<RoutedClick>().swap(source[shard]);
+        std::vector<RoutedClick<Stamp>>().swap(source[shard]);
     }
 
     group_by_user(events, names.size());
@@ -750,12 +809,10 @@ void prepare_table(const fs::path& path) {
     }
 }
 
-int run() {
+template<class Stamp>
+int run_impl(const fs::path& data, const fs::path& output,
+             unsigned threads, i64 start, i64 end) {
     Progress progress;
-    fs::path data = setting("DATA_DIR", "/data");
-    fs::path output = setting("OUTPUT_DIR", "/output");
-    unsigned threads = std::clamp<i64>(decimal(setting("NCPU", "8"), 4096), 1, 128);
-    auto [start, end] = read_window(data / "manifest.json");
     FastTimestamp parser(start, end);
     int first_day = utc_day(start);
     int days = utc_day(end - 1) - first_day + 1;
@@ -782,8 +839,8 @@ int run() {
     const Identities& people = *people_ptr;
     progress.log("load links");
 
-    std::vector<Shards<RoutedEvent>> event_shards(threads);
-    std::vector<Shards<RoutedClick>> click_shards(threads);
+    std::vector<Shards<RoutedEvent<Stamp>>> event_shards(threads);
+    std::vector<Shards<RoutedClick<Stamp>>> click_shards(threads);
     route_events(scan, threads, start, end, people, dimensions, parser, event_shards);
     progress.log("route events");
     route_clicks(click_files, threads, start, end, people, dimensions, parser, click_shards);
@@ -817,6 +874,15 @@ int run() {
     write_campaigns(output / "campaign_daily" / "shopping-0.parquet", dimensions.campaigns, totals, first_day);
     progress.log("sort, aggregate and write parquet");
     return 0;
+}
+int run() {
+    fs::path data = setting("DATA_DIR", "/data");
+    fs::path output = setting("OUTPUT_DIR", "/output");
+    unsigned threads = std::clamp<i64>(decimal(setting("NCPU", "8"), 4096), 1, 128);
+    auto [start, end] = read_window(data / "manifest.json");
+    if (end - start <= i64(std::numeric_limits<u32>::max()) - week_ms)
+        return run_impl<u32>(data, output, threads, start, end);
+    return run_impl<i64>(data, output, threads, start, end);
 }
 }
 
