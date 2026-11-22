@@ -625,12 +625,15 @@ void group_by_user(std::vector<Row>& rows, size_t users) {
     for (const Row& row : rows) ++start[row.user() + 1];
     for (size_t user = 0; user < users; ++user) start[user + 1] += start[user];
     std::vector<Row> sorted(rows.size());
-    std::vector<u32> next(start.begin(), start.end() - 1);
-    for (const Row& row : rows) sorted[next[row.user()]++] = row;
+    // Scatter backwards into each user's range using the exclusive prefix
+    // boundaries as cursors. This eliminates a second cursor array.
+    for (const Row& row : rows) sorted[--start[row.user() + 1]] = row;
     for (size_t user = 0; user < users; ++user) {
-        auto first = sorted.begin() + start[user], last = sorted.begin() + start[user + 1];
-        if (last - first > 1) {
-            std::sort(first, last, [](const Row& a, const Row& b) { return a.key < b.key; });
+        const size_t begin = start[user + 1];
+        const size_t finish = (user + 1 == users) ? sorted.size() : start[user + 2];
+        if (finish - begin > 1) {
+            std::sort(sorted.begin() + begin, sorted.begin() + finish,
+                      [](const Row& a, const Row& b) { return a.key < b.key; });
         }
     }
     rows.swap(sorted);

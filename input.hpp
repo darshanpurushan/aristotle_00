@@ -257,7 +257,9 @@ void parallel(size_t count, unsigned threads, Function work) {
     std::exception_ptr failure;
     std::mutex failure_mutex;
     std::vector<std::jthread> workers;
-    for (unsigned worker = 0; worker < threads; ++worker) {
+    const unsigned active = std::min<size_t>(threads, count);
+    workers.reserve(active);
+    for (unsigned worker = 0; worker < active; ++worker) {
         workers.emplace_back([&, worker] {
             try {
                 for (;;) {
