@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-Native C++20 entry for the [Databricks Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It writes both required Parquet tables with Arrow C++. The image downloads a pinned Arrow distribution at build time. The executable runs offline and uses no Python interpreter.
+Entry for the [Databricks Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). It writes both required Parquet tables with Arrow C++. The image downloads a pinned Arrow distribution at build time. The executable runs offline and uses no Python interpreter.
 
 ## Build and run
 
