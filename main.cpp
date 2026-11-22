@@ -11,7 +11,16 @@
 
 namespace shopping {
 constexpr size_t shard_count = 128;
-using Hash = std::hash<View>;
+struct Hash {
+    size_t operator()(View value) const noexcept {
+        uint64_t hash = 14695981039346656037ULL;
+        for (unsigned char byte : value) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        return size_t(hash);
+    }
+};
 
 size_t shard_for(size_t hash) {
     return (hash >> 32) % shard_count;
@@ -500,6 +509,9 @@ void aggregate_shard(size_t shard, std::vector<Shards<RoutedEvent>>& event_shard
     }
 
     std::vector<Click> clicks;
+    size_t click_count = 0;
+    for (const auto& source : click_shards) click_count += source[shard].size();
+    clicks.reserve(click_count + 1);
     for (auto& source : click_shards) {
         for (const RoutedClick& row : source[shard]) {
             auto user = users.find(row.user, Hash{}(row.user));
@@ -509,7 +521,7 @@ void aggregate_shard(size_t shard, std::vector<Shards<RoutedEvent>>& event_shard
     }
 
     auto order = [](const auto& a, const auto& b) {
-        return std::tie(a.user, a.ts) < std::tie(b.user, b.ts);
+        return a.user != b.user ? a.user < b.user : a.ts < b.ts;
     };
     std::sort(events.begin(), events.end(), order);
     std::sort(clicks.begin(), clicks.end(), order);

@@ -63,17 +63,16 @@ inline i64 timestamp(View s) {
         return value < 0 ? invalid_time : value;
     }
     auto pair = [&](size_t i) {
-        unsigned a = unsigned(s[i]) - '0', b = unsigned(s[i + 1]) - '0';
+        unsigned a = unsigned(s[i]) - '0';
+        unsigned b = unsigned(s[i + 1]) - '0';
         return a < 10 && b < 10 ? int(a * 10 + b) : -1;
     };
-    int year_high = pair(0), year_low = pair(2);
+    int year = pair(0) * 100 + pair(2);
     int month = pair(5), date = pair(8), hour = pair(11), minute = pair(14), second = pair(17);
-    if (year_high < 0 || year_low < 0 || month < 1 || month > 12 || date < 1 ||
+    if (year < 1 || month < 1 || month > 12 || date < 1 ||
         hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
         return invalid_time;
     }
-    int year = year_high * 100 + year_low;
-    if (year == 0) return invalid_time;
     bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     constexpr int lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     constexpr int offsets[] = {0,31,59,90,120,151,181,212,243,273,304,334};

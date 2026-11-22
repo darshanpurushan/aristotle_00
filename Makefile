@@ -1,7 +1,7 @@
 CXX ?= g++
 ARROW_DIR ?= $(CURDIR)/.deps/arrow
 ARCH_FLAGS ?= -march=x86-64-v3
-CXXFLAGS ?= -O3 -DNDEBUG
+CXXFLAGS ?= -O3 -DNDEBUG -flto
 CPPFLAGS += -isystem $(ARROW_DIR)/include
 ARROW_LIBS = -L$(ARROW_DIR) -Wl,-rpath,$(ARROW_DIR) -l:libparquet.so.2200 -l:libarrow.so.2200
 
