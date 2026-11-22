@@ -47,8 +47,9 @@ using Shards = std::array<std::vector<T>, shard_count>;
 template<class T>
 using Dictionary = std::unordered_map<View, T, Hash>;
 
-// Separate the compact probe array from the keys. Hash matches still compare
-// the full ID, so collisions never merge distinct IDs.
+// Open-addressing index. Each probe slot holds (hash tag, entry position), so a probe only
+// dereferences the entry (and then the key bytes) when the 32-bit tag already matches.
+// Matches still compare the full ID, so collisions never merge distinct IDs.
 template<class T>
 class StringIndex {
 public:
@@ -60,46 +61,69 @@ public:
 
     const T* find(View key, size_t hash) const {
         if (slots_.empty()) return nullptr;
-        u32 position = slots_[slot_for(key, hash)];
-        return position == absent ? nullptr : &entries_[position].value;
+        u64 slot = slot_for(key, hash);
+        return slots_[slot] == empty ? nullptr : &entries_[u32(slots_[slot])].value;
     }
 
     std::pair<T*, bool> insert(View key, size_t hash, T value) {
-        if ((entries_.size() + 1) * 3 > slots_.size() * 2) grow();
-        size_t slot = slot_for(key, hash);
-        u32 position = slots_[slot];
-        if (position != absent) return {&entries_[position].value, false};
-        slots_[slot] = entries_.size();
+        if ((entries_.size() + 1) * 2 > slots_.size()) grow();
+        u64 slot = slot_for(key, hash);
+        if (slots_[slot] != empty) return {&entries_[u32(slots_[slot])].value, false};
+        slots_[slot] = (u64(hash >> 32) << 32) | u64(entries_.size());
         entries_.push_back({key, hash, value});
         return {&entries_.back().value, true};
     }
 
     std::vector<Entry>& entries() { return entries_; }
 
+    // Software prefetch pipeline for batched lookups: slot, then entry, then key bytes.
+    void prefetch_slot(size_t hash) const {
+        if (!slots_.empty()) __builtin_prefetch(&slots_[hash & (slots_.size() - 1)]);
+    }
+    void prefetch_entry(size_t hash) const {
+        if (slots_.empty()) return;
+        u64 value = slots_[hash & (slots_.size() - 1)];
+        if (value != empty) __builtin_prefetch(&entries_[u32(value)]);
+    }
+    void prefetch_key(size_t hash) const {
+        if (slots_.empty()) return;
+        u64 value = slots_[hash & (slots_.size() - 1)];
+        if (value != empty) __builtin_prefetch(entries_[u32(value)].key.data());
+    }
+
 private:
-    size_t slot_for(View key, size_t hash) const {
-        size_t mask = slots_.size() - 1;
-        size_t slot = hash & mask;
+    static constexpr u64 empty = ~u64(0);
+
+    static bool same(View a, View b) {
+        return a.size() == b.size() && (a.data() == b.data() || std::memcmp(a.data(), b.data(), a.size()) == 0);
+    }
+
+    u64 slot_for(View key, size_t hash) const {
+        u64 mask = slots_.size() - 1;
+        u64 slot = hash & mask;
+        const u32 tag = u32(hash >> 32);
         for (;;) {
-            u32 position = slots_[slot];
-            if (position == absent) return slot;
-            const auto& entry = entries_[position];
-            if (entry.hash == hash && entry.key == key) return slot;
+            u64 value = slots_[slot];
+            if (value == empty) return slot;
+            if (u32(value >> 32) == tag) {
+                const auto& entry = entries_[u32(value)];
+                if (entry.hash == hash && same(entry.key, key)) return slot;
+            }
             slot = (slot + 1) & mask;
         }
     }
 
     void grow() {
-        slots_.assign(slots_.empty() ? 16 : slots_.size() * 2, absent);
-        size_t mask = slots_.size() - 1;
+        slots_.assign(slots_.empty() ? 16 : slots_.size() * 2, empty);
+        u64 mask = slots_.size() - 1;
         for (size_t i = 0; i < entries_.size(); ++i) {
-            size_t slot = entries_[i].hash & mask;
-            while (slots_[slot] != absent) slot = (slot + 1) & mask;
-            slots_[slot] = i;
+            u64 slot = entries_[i].hash & mask;
+            while (slots_[slot] != empty) slot = (slot + 1) & mask;
+            slots_[slot] = (u64(entries_[i].hash >> 32) << 32) | u64(i);
         }
     }
 
-    std::vector<u32> slots_;
+    std::vector<u64> slots_;
     std::vector<Entry> entries_;
 };
 
@@ -144,27 +168,41 @@ public:
                 if (minimum_[b].first < minimum_[a].first) minimum_[a] = minimum_[b];
             });
         }
-        for (auto& entry : nodes_.entries()) entry.value = root(entry.value);
+        // Node ids equal entry positions; resolve every entry to its person once.
+        for (auto& entry : nodes_.entries()) {
+            auto [name, hash] = minimum_[root(entry.value.node)];
+            entry.value.name = name;
+            entry.value.hash = hash;
+        }
     }
 
-    CanonicalUser canonical(View user) const {
-        size_t hash = Hash{}(user);
-        auto node = nodes_.find(user, hash);
-        if (!node) return {user, hash, false};
-        auto [name, name_hash] = minimum_[*node];
-        return {name, name_hash, true};
+    CanonicalUser canonical(View user) const { return canonical(user, Hash{}(user)); }
+    void prefetch_slot(size_t hash) const { nodes_.prefetch_slot(hash); }
+    void prefetch_entry(size_t hash) const { nodes_.prefetch_entry(hash); }
+    void prefetch_key(size_t hash) const { nodes_.prefetch_key(hash); }
+
+    CanonicalUser canonical(View user, size_t hash) const {
+        auto person = nodes_.find(user, hash);
+        if (!person) return {user, hash, false};
+        return {person->name, person->hash, true};
     }
 
 private:
+    struct Person {
+        u32 node;
+        View name;
+        size_t hash;
+    };
+
     u32 intern(View id) {
         size_t hash = Hash{}(id);
-        auto [node, inserted] = nodes_.insert(id, hash, parent_.size());
+        auto [person, inserted] = nodes_.insert(id, hash, {u32(parent_.size()), {}, 0});
         if (inserted) {
-            parent_.push_back(*node);
+            parent_.push_back(person->node);
             size_.push_back(1);
             minimum_.emplace_back(id, hash);
         }
-        return *node;
+        return person->node;
     }
 
     u32 root(u32 node) {
@@ -175,7 +213,7 @@ private:
         return node;
     }
 
-    StringIndex<u32> nodes_;
+    StringIndex<Person> nodes_;
     std::vector<u32> parent_, size_;
     std::vector<std::pair<View, size_t>> minimum_;
 };
@@ -347,6 +385,25 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
         Chunk chunk = chunks[index];
         u64 base = u64(index) << 32;
         auto skip = std::lower_bound(losers.begin(), losers.end(), base);
+        struct Pending {
+            View user;
+            size_t hash;
+            i64 ts;
+            u32 price, category;
+        };
+        constexpr size_t batch = 16;
+        Pending pending[batch];
+        size_t held = 0;
+        auto flush = [&] {
+            for (size_t i = 0; i < held; ++i) people.prefetch_entry(pending[i].hash);
+            for (size_t i = 0; i < held; ++i) people.prefetch_key(pending[i].hash);
+            for (size_t i = 0; i < held; ++i) {
+                const Pending& p = pending[i];
+                auto person = people.canonical(p.user, p.hash);
+                routed[worker][shard_for(person.hash)].push_back({person.id, person.hash, p.ts, p.price, p.category});
+            }
+            held = 0;
+        };
         for_lines(chunk, [&](View line) {
             u64 location = base | u32(line.data() - chunk.start);
             if (skip != losers.end() && *skip == location) {
@@ -367,9 +424,12 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
             } else if (row[4] != "view" && row[4] != "cart") {
                 return;
             }
-            auto [user, hash, linked] = people.canonical(row[1]);
-            routed[worker][shard_for(hash)].push_back({user, hash, ts, price, category});
+            size_t hash = Hash{}(row[1]);
+            people.prefetch_slot(hash);
+            pending[held++] = {row[1], hash, ts, price, category};
+            if (held == batch) flush();
         });
+        flush();
     });
 }
 
@@ -379,6 +439,26 @@ void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start
     std::vector<Chunk> chunks;
     for (const auto& file : files) file.add_chunks(chunks);
     parallel(chunks.size(), threads, [&](size_t index, unsigned worker) {
+        struct Pending {
+            View user, id;
+            size_t hash;
+            i64 ts;
+            u32 campaign;
+        };
+        constexpr size_t batch = 16;
+        Pending pending[batch];
+        size_t held = 0;
+        auto flush = [&] {
+            for (size_t i = 0; i < held; ++i) people.prefetch_entry(pending[i].hash);
+            for (size_t i = 0; i < held; ++i) people.prefetch_key(pending[i].hash);
+            for (size_t i = 0; i < held; ++i) {
+                const Pending& p = pending[i];
+                auto person = people.canonical(p.user, p.hash);
+                // Exact duplicate clicks contribute identically to both the winner and the union.
+                routed[worker][shard_for(person.hash)].push_back({person.id, p.id, person.hash, p.ts, p.campaign});
+            }
+            held = 0;
+        };
         for_lines(chunks[index], [&](View line) {
             std::array<View, 4> row;
             if (!fields(line, row) || row[0].empty() || row[1].empty()) return;
@@ -386,12 +466,38 @@ void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start
             if (ts < start - week_ms || ts >= end) return;
             auto campaign = dimensions.campaign_index.find(row[2]);
             if (campaign == dimensions.campaign_index.end()) return;
-            auto user = people.canonical(row[1]);
-            // Exact duplicate clicks contribute identically to both the winner and the union.
-            routed[worker][shard_for(user.hash)].push_back({user.id, row[0], user.hash, ts, campaign->second});
+            size_t hash = Hash{}(row[1]);
+            people.prefetch_slot(hash);
+            pending[held++] = {row[1], row[0], hash, ts, campaign->second};
+            if (held == batch) flush();
         });
+        flush();
     });
 }
+
+// Small bump allocator for the person names of one shard, so the shard's lookup table and
+// output rows read hot, compact memory instead of the (cold) mapped input files.
+class NameArena {
+public:
+    View copy(View text) {
+        if (text.size() > block_left_) {
+            size_t size = std::max<size_t>(text.size(), 64 * 1024);
+            blocks_.push_back(std::make_unique<char[]>(size));
+            block_ = blocks_.back().get();
+            block_left_ = size;
+        }
+        char* destination = block_;
+        std::memcpy(destination, text.data(), text.size());
+        block_ += text.size();
+        block_left_ -= text.size();
+        return View(destination, text.size());
+    }
+
+private:
+    std::vector<std::unique_ptr<char[]>> blocks_;
+    char* block_ = nullptr;
+    size_t block_left_ = 0;
+};
 
 struct Session {
     i64 start;
@@ -510,6 +616,26 @@ private:
     UserWriter user_rows_;
 };
 
+// Stable counting sort on the user index (the high key bits), then a comparison sort of the
+// few rows each user has. Much cheaper than sorting the whole shard by comparison.
+template<class Row>
+void group_by_user(std::vector<Row>& rows, size_t users) {
+    if (rows.size() < 2) return;
+    std::vector<u32> start(users + 1, 0);
+    for (const Row& row : rows) ++start[row.user() + 1];
+    for (size_t user = 0; user < users; ++user) start[user + 1] += start[user];
+    std::vector<Row> sorted(rows.size());
+    std::vector<u32> next(start.begin(), start.end() - 1);
+    for (const Row& row : rows) sorted[next[row.user()]++] = row;
+    for (size_t user = 0; user < users; ++user) {
+        auto first = sorted.begin() + start[user], last = sorted.begin() + start[user + 1];
+        if (last - first > 1) {
+            std::sort(first, last, [](const Row& a, const Row& b) { return a.key < b.key; });
+        }
+    }
+    rows.swap(sorted);
+}
+
 void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& event_shards,
                      std::vector<Shards<RoutedClick>>& click_shards, Aggregation& output) {
     StringIndex<u32> users;
@@ -518,12 +644,19 @@ void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& 
     size_t count = 0;
     for (const auto& source : event_shards) count += source[shard].size();
     events.reserve(count);
+    NameArena arena;
+    constexpr size_t ahead = 12;
     for (auto& source : event_shards) {
-        for (const RoutedEvent& row : source[shard]) {
+        const auto& rows = source[shard];
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i + ahead < rows.size()) __builtin_prefetch(rows[i + ahead].user.data());
+            const RoutedEvent& row = rows[i];
             auto [entry, inserted] = users.insert(row.user, row.hash, names.size());
             if (inserted) {
                 if (names.size() >= max_users - 1) throw std::runtime_error("Too many people in one shard");
-                names.push_back(row.user);
+                View stored = arena.copy(row.user);
+                users.entries().back().key = stored;
+                names.push_back(stored);
             }
             u64 offset = u64(row.ts - start);
             events.push_back({(u64(*entry) << key_shift) | offset, row.price, row.category});
@@ -537,15 +670,18 @@ void aggregate_shard(size_t shard, i64 start, std::vector<Shards<RoutedEvent>>& 
     for (const auto& source : click_shards) click_count += source[shard].size();
     clicks.reserve(click_count + 1);
     for (auto& source : click_shards) {
-        for (const RoutedClick& row : source[shard]) {
+        const auto& rows = source[shard];
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i + ahead < rows.size()) __builtin_prefetch(rows[i + ahead].user.data());
+            const RoutedClick& row = rows[i];
             auto user = users.find(row.user, row.hash);
             if (user) clicks.push_back({(u64(*user) << key_shift) | u64(row.ts - click_base), row.id, row.campaign});
         }
         std::vector<RoutedClick>().swap(source[shard]);
     }
 
-    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) { return a.key < b.key; });
-    std::sort(clicks.begin(), clicks.end(), [](const Click& a, const Click& b) { return a.key < b.key; });
+    group_by_user(events, names.size());
+    group_by_user(clicks, names.size());
     // Sentinel: user index max_users sorts after every real user.
     clicks.push_back({~u64(0), {}, 0});
 
@@ -630,8 +766,9 @@ int run() {
         aggregate_shard(order[shard], start, event_shards, click_shards, *workers[worker]);
     });
     std::vector<CampaignTotal> totals(size_t(days) * dimensions.campaigns.size());
+    // Flush the last batch and write each file's footer on its own thread.
+    parallel(threads, threads, [&](size_t worker, unsigned) { workers[worker]->close(worker == 0); });
     for (unsigned worker = 0; worker < threads; ++worker) {
-        workers[worker]->close(worker == 0);
         const auto& partial = workers[worker]->totals();
         for (size_t row = 0; row < totals.size(); ++row) totals[row] += partial[row];
     }
