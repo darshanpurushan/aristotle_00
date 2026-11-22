@@ -14,24 +14,32 @@ constexpr size_t shard_count = 128;
 
 // Word-at-a-time hash (the IDs are opaque strings of 1 to ~40 bytes). Only needs to be
 // consistent inside one process; both the low bits (tables) and high bits (shards) are mixed.
+inline u64 fast_mix(u64 a, u64 b) {
+    __uint128_t p = (__uint128_t)a * b;
+    return u64(p) ^ u64(p >> 64);
+}
 inline size_t hash_bytes(const char* p, size_t n) {
-    constexpr u64 K = 0x9E3779B97F4A7C15ULL, M = 0xff51afd7ed558ccdULL;
-    u64 h = (n + 1) * K;
-    auto load8 = [](const char* q) { u64 w; std::memcpy(&w, q, 8); return w; };
-    if (n >= 8) {
-        const char* last = p + n - 8;
-        for (; p < last; p += 8) { h = (h ^ load8(p)) * M; h ^= h >> 32; }
-        h = (h ^ load8(last)) * M; h ^= h >> 32;
-    } else if (n >= 4) {
-        u32 a, b;
-        std::memcpy(&a, p, 4); std::memcpy(&b, p + n - 4, 4);
-        h = (h ^ (u64(a) << 32 | b)) * M; h ^= h >> 32;
-    } else if (n) {
-        u64 w = u64(u8(p[0])) | u64(u8(p[n >> 1])) << 8 | u64(u8(p[n - 1])) << 16;
-        h = (h ^ w) * M; h ^= h >> 32;
+    constexpr u64 K = 0x9e3779b97f4a7c15ULL;
+    constexpr u64 L = 0xa0761d6478bd642fULL;
+    auto load8 = [](const char* q) { u64 a; std::memcpy(&a, q, 8); return a; };
+    auto load4 = [](const char* q) { u32 a; std::memcpy(&a, q, 4); return a; };
+    u64 a, b;
+    if (n <= 16) {
+        if (n >= 8) {
+            a = load8(p); b = load8(p + n - 8);
+        } else if (n >= 4) {
+            a = (u64(load4(p)) << 32) | load4(p + n - 4);
+            b = n * K;
+        } else if (n) {
+            a = u64(u8(p[0])) | u64(u8(p[n >> 1])) << 8 | u64(u8(p[n - 1])) << 16;
+            b = n * K;
+        } else { a = 0; b = 0; }
+        return fast_mix(a ^ K, b ^ L ^ n);
     }
-    h *= K; h ^= h >> 29; h *= M; h ^= h >> 32;
-    return size_t(h);
+    u64 h = n * K;
+    for (size_t offset = 0; offset + 16 < n; offset += 16)
+        h = fast_mix(h ^ load8(p + offset), L ^ load8(p + offset + 8));
+    return fast_mix(h ^ load8(p + n - 16), K ^ load8(p + n - 8));
 }
 struct Hash {
     size_t operator()(View v) const noexcept { return hash_bytes(v.data(), v.size()); }
@@ -377,7 +385,7 @@ EventScan index_events(const std::vector<Mapping>& files, unsigned threads, Prog
 // The event files stay mapped until the end of the run, so routed records point straight
 // into them and no per-event copy or interning of user names is needed.
 void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
-                  const Identities& people, const Dimensions& dimensions,
+                  const Identities& people, const Dimensions& dimensions, const FastTimestamp& parser,
                   std::vector<Shards<RoutedEvent>>& routed) {
     const auto& chunks = scan.chunks;
     const auto& losers = scan.losers;
@@ -412,8 +420,8 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
             }
             std::array<View, 7> row;
             if (!fields(line, row) || row[0].empty() || row[1].empty() || row[5].empty()) return;
-            i64 ts = timestamp(row[2]);
-            if (ts < start || ts >= end || timestamp(row[3]) - ts > day_ms) return;
+            i64 ts = parser.parse(row[2]);
+            if (ts < start || ts >= end || parser.ingest(row[3]) - ts > day_ms) return;
             u32 price = 0, category = 0;
             if (row[4] == "purchase") {
                 i64 value = decimal(row[6], 10'000'000);
@@ -434,7 +442,7 @@ void route_events(const EventScan& scan, unsigned threads, i64 start, i64 end,
 }
 
 void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start, i64 end,
-                  const Identities& people, const Dimensions& dimensions,
+                  const Identities& people, const Dimensions& dimensions, const FastTimestamp& parser,
                   std::vector<Shards<RoutedClick>>& routed) {
     std::vector<Chunk> chunks;
     for (const auto& file : files) file.add_chunks(chunks);
@@ -462,7 +470,7 @@ void route_clicks(const std::vector<Mapping>& files, unsigned threads, i64 start
         for_lines(chunks[index], [&](View line) {
             std::array<View, 4> row;
             if (!fields(line, row) || row[0].empty() || row[1].empty()) return;
-            i64 ts = timestamp(row[3]);
+            i64 ts = parser.parse(row[3]);
             if (ts < start - week_ms || ts >= end) return;
             auto campaign = dimensions.campaign_index.find(row[2]);
             if (campaign == dimensions.campaign_index.end()) return;
@@ -618,6 +626,25 @@ private:
 
 // Stable counting sort on the user index (the high key bits), then a comparison sort of the
 // few rows each user has. Much cheaper than sorting the whole shard by comparison.
+// Time offsets fit within 31 bits for the generator's 14-day window.
+// Fallback to comparison sorting if a fixture uses a longer window.
+template<class Row>
+void sort_long_group(Row* first, Row* last) {
+    const size_t n = last - first;
+    constexpr size_t radix = 65536;
+    std::array<u32, radix> counts{};
+    std::vector<Row> scratch(n);
+    for (size_t i = 0; i < n; ++i) ++counts[u32(first[i].key) & 65535];
+    u32 running = 0;
+    for (u32& count : counts) {u32 old = count; count = running; running += old;}
+    for (size_t i = 0; i < n; ++i) scratch[counts[u32(first[i].key) & 65535]++] = first[i];
+    counts.fill(0);
+    for (size_t i = 0; i < n; ++i) ++counts[u32(scratch[i].key >> 16) & 65535];
+    running = 0;
+    for (u32& count : counts) {u32 old = count; count = running; running += old;}
+    for (size_t i = 0; i < n; ++i) first[counts[u32(scratch[i].key >> 16) & 65535]++] = scratch[i];
+}
+
 template<class Row>
 void group_by_user(std::vector<Row>& rows, size_t users) {
     if (rows.size() < 2) return;
@@ -632,9 +659,20 @@ void group_by_user(std::vector<Row>& rows, size_t users) {
         const size_t begin = start[user + 1];
         const size_t finish = (user + 1 == users) ? sorted.size() : start[user + 2];
         if (finish - begin > 1) {
+            if (finish - begin >= 8192) {
+                bool small_times = true;
+                for (size_t k = begin; k < finish; ++k) {
+                    if ((sorted[k].key & key_mask) >= (u64(1) << 32)) { small_times = false; break; }
+                }
+                if (small_times) {
+                    sort_long_group(sorted.data() + begin, sorted.data() + finish);
+                    continue;
+                }
+            }
             std::sort(sorted.begin() + begin, sorted.begin() + finish,
                       [](const Row& a, const Row& b) { return a.key < b.key; });
         }
+
     }
     rows.swap(sorted);
 }
@@ -718,6 +756,7 @@ int run() {
     fs::path output = setting("OUTPUT_DIR", "/output");
     unsigned threads = std::clamp<i64>(decimal(setting("NCPU", "8"), 4096), 1, 128);
     auto [start, end] = read_window(data / "manifest.json");
+    FastTimestamp parser(start, end);
     int first_day = utc_day(start);
     int days = utc_day(end - 1) - first_day + 1;
 
@@ -745,9 +784,9 @@ int run() {
 
     std::vector<Shards<RoutedEvent>> event_shards(threads);
     std::vector<Shards<RoutedClick>> click_shards(threads);
-    route_events(scan, threads, start, end, people, dimensions, event_shards);
+    route_events(scan, threads, start, end, people, dimensions, parser, event_shards);
     progress.log("route events");
-    route_clicks(click_files, threads, start, end, people, dimensions, click_shards);
+    route_clicks(click_files, threads, start, end, people, dimensions, parser, click_shards);
     progress.log("route clicks");
 
     // Largest shards first, so whale shards do not become the tail of the run.

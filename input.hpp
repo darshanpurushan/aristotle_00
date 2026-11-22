@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -96,6 +97,105 @@ inline i64 timestamp(View s) {
                offsets[month - 1] + (month > 2 && leap) + date - 1;
     return ((i64(days) * 24 + hour) * 3600 + (minute - offset) * 60 + second) * 1000;
 }
+
+// Cache just the dates that can affect this execution window. The input
+// contains arbitrary valid/invalid timestamp strings, so every cache miss
+// falls back to the complete strict parser above.
+class FastTimestamp {
+public:
+    FastTimestamp(i64 start, i64 end) {
+        int first = int(utc_day(start - week_ms - 2 * day_ms));
+        int last = int(utc_day(end + 9 * day_ms));
+        for (int day = first; day <= last && day < first + 96; ++day) {
+            std::time_t seconds = std::time_t(i64(day) * 86400);
+            std::tm tm{};
+            gmtime_r(&seconds, &tm);
+            char digits[10];
+            int year = tm.tm_year + 1900;
+            int month = tm.tm_mon + 1;
+            int mday = tm.tm_mday;
+            digits[0] = '0' + year / 1000 % 10;
+            digits[1] = '0' + year / 100 % 10;
+            digits[2] = '0' + year / 10 % 10;
+            digits[3] = '0' + year % 10;
+            digits[4] = '-';
+            digits[5] = '0' + month / 10;
+            digits[6] = '0' + month % 10;
+            digits[7] = '-';
+            digits[8] = '0' + mday / 10;
+            digits[9] = '0' + mday % 10;
+            u64 prefix; u16 suffix;
+            std::memcpy(&prefix, digits, 8);
+            std::memcpy(&suffix, digits + 8, 2);
+            auto slot = slot_for(prefix, suffix);
+            while (days_[slot].prefix) slot = (slot + 1) & (table_size - 1);
+            days_[slot] = {prefix, suffix, day};
+        }
+    }
+
+    i64 parse(View s) const {
+        if ((s.size() != 20 && s.size() != 25) || s[4] != '-' || s[7] != '-' ||
+            s[10] != 'T' || s[13] != ':' || s[16] != ':') return timestamp(s);
+        int day = date(s.data());
+        if (day == missing) return timestamp(s);
+        const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+        unsigned bad = 0;
+        for (int i : {11, 12, 14, 15, 17, 18}) bad |= (unsigned(p[i]) - '0') > 9;
+        if (bad) return invalid_time;
+        int h = (p[11] - '0') * 10 + p[12] - '0';
+        int m = (p[14] - '0') * 10 + p[15] - '0';
+        int sec = (p[17] - '0') * 10 + p[18] - '0';
+        if (h > 23 || m > 59 || sec > 59) return invalid_time;
+        if (s.size() == 20) {
+            if (s[19] != 'Z') return invalid_time;
+        } else {
+            if ((s[19] != '+' && s[19] != '-') || s[22] != ':') return invalid_time;
+            for (int i : {20,21,23,24}) if ((unsigned(p[i]) - '0') > 9) return invalid_time;
+            int offset_hours = (p[20] - '0') * 10 + p[21] - '0';
+            int offset_minutes = (p[23] - '0') * 10 + p[24] - '0';
+            if (offset_hours > 23 || offset_minutes > 59) return invalid_time;
+            int delta = offset_hours * 60 + offset_minutes;
+            m += s[19] == '+' ? -delta : delta;
+        }
+        return (i64(day) * 86400 + h * 3600 + m * 60 + sec) * 1000;
+    }
+
+    i64 ingest(View s) const {
+        if (s.size() != 20 || s[19] != 'Z') return timestamp(s);
+        int day = date(s.data());
+        if (day == missing) return timestamp(s);
+        const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+        int h = (p[11] - '0') * 10 + p[12] - '0';
+        int m = (p[14] - '0') * 10 + p[15] - '0';
+        int sec = (p[17] - '0') * 10 + p[18] - '0';
+        return (i64(day) * 86400 + h * 3600 + m * 60 + sec) * 1000;
+    }
+
+private:
+    using u16 = uint16_t;
+    struct DateSlot {u64 prefix = 0; u16 suffix = 0; int day = 0;};
+    static constexpr unsigned table_size = 128;
+    static constexpr int missing = std::numeric_limits<int>::min();
+    std::array<DateSlot, table_size> days_{};
+    static unsigned slot_for(u64 prefix, u16 suffix) {
+        u64 mixed = prefix ^ (u64(suffix) << 48);
+        mixed ^= mixed >> 32;
+        mixed *= 0x9E3779B97F4A7C15ULL;
+        return unsigned(mixed >> 57);
+    }
+    int date(const char* p) const {
+        u64 prefix; u16 suffix;
+        std::memcpy(&prefix, p, 8);
+        std::memcpy(&suffix, p + 8, 2);
+        auto slot = slot_for(prefix, suffix);
+        for (;;) {
+            const auto& entry = days_[slot];
+            if (!entry.prefix) return missing;
+            if (entry.prefix == prefix && entry.suffix == suffix) return entry.day;
+            slot = (slot + 1) & (table_size - 1);
+        }
+    }
+};
 
 inline bool unquote(View& field) {
     if (!field.empty() && field.front() == '"') {
